@@ -33,7 +33,8 @@ class JsonSerializer
      * @var string hash token used to identify PHP classes
      */
     const TYPE = '#type';
-
+    
+    const REFERENCE = '#ref';
     /**
      * @var string hash token previously used to identify PHP hashes (arrays with keys)
      */
@@ -77,6 +78,8 @@ class JsonSerializer
      */
     private $unserializers = array();
 
+    private $_doneRefs = array();
+    
     /**
      * @param bool $pretty true to enable "pretty" JSON formatting.
      */
@@ -101,6 +104,38 @@ class JsonSerializer
         );
     }
 
+    private function getRef($type, $object) {
+        if (!isset($this->_doneRefs[$type])) {
+            return FALSE;
+        }
+
+        foreach($this->_doneRefs[$type] as $key => $ref) {
+            if ($ref === $object) {
+                return $key;
+            }
+        }
+        return FALSE;
+    }
+
+    private function setRef($type, $object) {
+        if (!isset($this->_doneRefs[$type])) {
+                $this->_doneRefs[$type] = array();
+        }
+        $this->_doneRefs[$type][] = $object;
+    }
+
+    private function done($type, $object) {
+        return ($this->getRef($type, $object) === FALSE) ? FALSE : TRUE;
+    }
+
+    private function isRef($data) {
+        return isset($data[self::REFERENCE]);
+    }
+
+    private function getObj($type, $data) {
+        return $this->_doneRefs[$type][$data[self::REFERENCE]];
+    }
+    
     /**
      * Serialize a given PHP value/array/object-graph to a JSON representation.
      *
@@ -110,6 +145,7 @@ class JsonSerializer
      */
     public function serialize($value)
     {
+        $this->_doneRefs = array();
         return $this->_serialize($value, 0);
     }
 
@@ -122,8 +158,8 @@ class JsonSerializer
      */
     public function unserialize($string)
     {
+        $this->_doneRefs = array();
         $data = json_decode($string, true);
-
         return $this->_unserialize($data);
     }
 
@@ -204,21 +240,33 @@ class JsonSerializer
     {
         $type = get_class($object);
 
-        if (isset($this->serializers[$type])) {
-            return $this->_serialize(call_user_func($this->serializers[$type], $object), $indent);
-        }
-
         $whitespace = $this->newline . str_repeat($this->indentation, $indent + 1);
-
         $string = '{' . $whitespace . '"' . self::TYPE . '":' . $this->padding . json_encode($type);
 
-        foreach ($this->_getClassProperties($type) as $name => $prop) {
-            $string .= ','
-                . $whitespace
-                . json_encode($name)
-                . ':'
-                . $this->padding
-                . $this->_serialize($prop->getValue($object), $indent + 1);
+        // check serialize state
+        if ($this->done($type, $object)) {
+                $string .= ','
+                        . $whitespace
+                        . '"' . self::REFERENCE . '"'
+                        . ':'
+                        . $this->padding
+                        . $this->getRef($type, $object);
+        } else {
+
+                $this->setRef($type, $object);
+
+                if (isset($this->serializers[$type])) {
+                    return $this->_serialize(call_user_func($this->serializers[$type], $object), $indent);
+                }
+
+                foreach ($this->_getClassProperties($type) as $name => $prop) {
+                    $string .= ','
+                        . $whitespace
+                        . json_encode($name)
+                        . ':'
+                        . $this->padding
+                        . $this->_serialize($prop->getValue($object), $indent + 1);
+                }
         }
 
         $string .= $this->newline . str_repeat($this->indentation, $indent) . '}';
@@ -335,8 +383,14 @@ class JsonSerializer
     {
         $type = $data[self::TYPE];
 
+        if ($this->isRef($data)) {
+                return $this->getObj($type, $data);
+        }
+        
         if (isset($this->unserializers[$type])) {
-            return $this->_unserialize(call_user_func($this->unserializers[$type], $data));
+            $object = $this->_unserialize(call_user_func($this->unserializers[$type], $data));
+            $this->setRef($type, $object);
+            return $object;
         }
 
         if ($type === self::STD_CLASS) {
@@ -344,10 +398,11 @@ class JsonSerializer
             return (object) $this->_unserializeArray($data);
         }
 
-        $object = unserialize('O:' . strlen($type) . ':"' . $type . '":0:{}');
-
-        // TODO support ReflectionClass::newInstanceWithoutConstructor() in PHP 5.4
-
+        //$object = unserialize('O:' . strlen($type) . ':"' . $type . '":0:{}');
+        $reflect = new \ReflectionClass($type);
+        $object = $reflect->newInstanceWithoutConstructor();
+        $this->setRef($type, $object);
+        
         foreach ($this->_getClassProperties($type) as $name => $prop) {
             if (array_key_exists($name, $data)) {
                 $value = $this->_unserialize($data[$name]);
